@@ -1,0 +1,546 @@
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+// Tiny .env loader so the project works without an extra runtime dependency.
+function loadDotEnv() {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) return;
+  for (const raw of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf('=');
+    if (idx < 1) continue;
+    const key = line.slice(0, idx).trim();
+    let value = line.slice(idx + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+}
+loadDotEnv();
+
+const express = require('express');
+const QRCode = require('qrcode');
+const PDFDocument = require('pdfkit');
+const nodemailer = require('nodemailer');
+const { ethers } = require('ethers');
+
+const PORT = Number(process.env.PORT || 3000);
+const RPC_URL = process.env.RPC_URL || 'http://127.0.0.1:8545';
+const SESSION_SECRET = process.env.SESSION_SECRET;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const ISSUER_PRIVATE_KEY = process.env.ISSUER_PRIVATE_KEY;
+
+if (!SESSION_SECRET || SESSION_SECRET.length < 32) throw new Error('SESSION_SECRET is missing or too short. Set a random value of at least 32 characters in .env.');
+if (!ADMIN_EMAIL || !ADMIN_PASSWORD || ADMIN_PASSWORD.length < 8) throw new Error('ADMIN_EMAIL and ADMIN_PASSWORD are required in .env; ADMIN_PASSWORD must be at least 8 characters.');
+if (!ISSUER_PRIVATE_KEY || !/^0x[0-9a-fA-F]{64}$/.test(ISSUER_PRIVATE_KEY)) throw new Error('ISSUER_PRIVATE_KEY is required in .env for the local issuer account.');
+
+const app = express();
+app.disable('x-powered-by');
+// Same-origin API by default. Do not enable wildcard CORS for an admin API.
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cache-Control', req.path.startsWith('/api/') ? 'no-store' : 'no-cache');
+  next();
+});
+app.use(express.json({ limit: '21mb' }));
+app.use(express.urlencoded({ extended: false, limit: '21mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+const DATA_PATH = path.join(__dirname, 'certichain-data.json');
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+function loadData() {
+  if (!fs.existsSync(DATA_PATH)) return { certificates: [], auditLogs: [] };
+  try {
+    const d = JSON.parse(fs.readFileSync(DATA_PATH, 'utf8'));
+    return { certificates: Array.isArray(d.certificates) ? d.certificates : [], auditLogs: Array.isArray(d.auditLogs) ? d.auditLogs : [] };
+  } catch {
+    return { certificates: [], auditLogs: [] };
+  }
+}
+let data = loadData();
+function saveData() {
+  const tmp = `${DATA_PATH}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, DATA_PATH);
+}
+function findCertificate(id) { return data.certificates.find(c => c.id === id); }
+function publicCertificate(c) {
+  if (!c) return c;
+  const { studentPasswordHash, filePath, ...safe } = c;
+  return safe;
+}
+function safeError(e) { return e?.shortMessage || e?.reason || 'Request failed. Check server logs for details.'; }
+function publicVerificationCertificate(c) {
+  if (!c) return c;
+  const { studentEmail, studentPasswordHash, filePath, documentHash, blockchainHash, ...safe } = c;
+  return safe;
+}
+const loginAttempts = new Map();
+function loginKey(req) { return req.ip || req.socket.remoteAddress || 'unknown'; }
+function clearLoginAttempts(req) { loginAttempts.delete(loginKey(req)); }
+function loginRateLimited(req) {
+  const now = Date.now();
+  const key = loginKey(req);
+  let state = loginAttempts.get(key);
+  if (!state || now - state.startedAt > 15 * 60 * 1000) state = { startedAt: now, count: 0, blockedUntil: 0 };
+  if (state.blockedUntil > now) { loginAttempts.set(key, state); return true; }
+  state.count += 1;
+  if (state.count > 10) state.blockedUntil = now + 15 * 60 * 1000;
+  loginAttempts.set(key, state);
+  if (loginAttempts.size > 5000) { for (const [k, v] of loginAttempts) if (now - v.startedAt > 15 * 60 * 1000) loginAttempts.delete(k); }
+  return state.blockedUntil > now;
+}
+function log(certificateId, action, result, req) {
+  data.auditLogs.unshift({ id: crypto.randomUUID(), certificateId: certificateId || null, action, result: result || '', createdAt: new Date().toISOString(), ip: req.ip });
+  data.auditLogs = data.auditLogs.slice(0, 1000);
+  saveData();
+}
+
+const deploymentPath = path.join(__dirname, 'deployment.json');
+if (!fs.existsSync(deploymentPath)) throw new Error('deployment.json not found. Run npm run dev first.');
+const deployment = JSON.parse(fs.readFileSync(deploymentPath, 'utf8'));
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+const issuerWallet = new ethers.Wallet(ISSUER_PRIVATE_KEY, provider);
+// NonceManager prevents duplicate transaction nonces when several writes happen in one process.
+const wallet = new ethers.NonceManager(issuerWallet);
+const registry = new ethers.Contract(deployment.address, deployment.abi, wallet);
+
+function sha256(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
+function makeCertificateId() { return `CERT-${new Date().getFullYear()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`; }
+function canonicalPayload(d) { return JSON.stringify({ studentName: d.studentName, studentEmail: d.studentEmail || '', course: d.course, institution: d.institution, issueDate: d.issueDate, grade: d.grade || '' }); }
+function qrEncryptionKey() {
+  return crypto.createHash('sha256').update('CertiChain QR Encryption v1|' + SESSION_SECRET).digest();
+}
+function encryptQrPayload(row) {
+  const payload = {
+    v: 1,
+    type: 'CERTICHAIN_CERTIFICATE',
+    certificateId: row.id,
+    name: row.studentName || '',
+    email: row.studentEmail || '',
+    course: row.course || '',
+    institution: row.institution || 'Srinivas Institute Of Technology, Valachil',
+    issuedDate: row.issueDate || '',
+    grade: row.grade || ''
+  };
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', qrEncryptionKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return 'CCQR1.' + [iv, tag, encrypted].map(b => b.toString('base64url')).join('.');
+}
+function decryptQrPayload(token) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 4 || parts[0] !== 'CCQR1') throw new Error('This is not a valid CertiChain encrypted QR code.');
+  const iv = Buffer.from(parts[1], 'base64url');
+  const tag = Buffer.from(parts[2], 'base64url');
+  const encrypted = Buffer.from(parts[3], 'base64url');
+  if (iv.length !== 12 || tag.length !== 16 || !encrypted.length) throw new Error('Invalid CertiChain QR payload.');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', qrEncryptionKey(), iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+  const payload = JSON.parse(plain);
+  if (payload.type !== 'CERTICHAIN_CERTIFICATE' || payload.v !== 1 || !payload.certificateId) throw new Error('Unsupported CertiChain QR payload.');
+  return payload;
+}
+function hashPassword(password) { return crypto.scryptSync(password, SESSION_SECRET, 64).toString('hex'); }
+function passwordMatches(password, hash) {
+  if (!password || !hash) return false;
+  const a = Buffer.from(hash, 'hex');
+  const b = Buffer.from(hashPassword(password), 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function tokenFor(role, email) {
+  const payload = Buffer.from(JSON.stringify({ role, email, exp: Date.now() + 8 * 60 * 60 * 1000 })).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+function auth(req) {
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ')) return null;
+  const parts = h.slice(7).split('.');
+  if (parts.length !== 2) return null;
+  try {
+    const expected = crypto.createHmac('sha256', SESSION_SECRET).update(parts[0]).digest('base64url');
+    if (expected !== parts[1]) return null;
+    const p = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+    if (!p.exp || p.exp < Date.now()) return null;
+    return p;
+  } catch { return null; }
+}
+function requireAdmin(req, res, next) {
+  const u = auth(req);
+  if (!u || u.role !== 'admin') return res.status(401).json({ error: 'Admin login required.' });
+  req.user = u; next();
+}
+function requireUser(req, res, next) {
+  const u = auth(req);
+  if (!u) return res.status(401).json({ error: 'Login required.' });
+  req.user = u; next();
+}
+function verificationUrl(req, id) {
+  const base = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+  return `${base}/?verify=${encodeURIComponent(id)}`;
+}
+async function makeQr(req, rowOrId) {
+  const row = typeof rowOrId === 'string' ? findCertificate(rowOrId) : rowOrId;
+  if (!row) throw new Error('Certificate not found.');
+  return QRCode.toDataURL(encryptQrPayload(row), { width: 360, margin: 2, errorCorrectionLevel: 'M' });
+}
+function dataUrlToBuffer(dataUrl) {
+  const match = /^data:[^;]+;base64,(.+)$/i.exec(dataUrl || '');
+  if (!match) throw new Error('Invalid base64 file data.');
+  return Buffer.from(match[1], 'base64');
+}
+function validateUpload(fileName, mime, bytes) {
+  const allowedMime = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/webp']);
+  const ext = path.extname(fileName || '').toLowerCase();
+  const allowedExt = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.webp']);
+  if (!allowedExt.has(ext)) throw new Error('Only PDF, PNG, JPG/JPEG and WEBP certificates are allowed.');
+  if (mime && !allowedMime.has(mime)) throw new Error('Unsupported certificate file type. Use PDF, PNG, JPG/JPEG or WEBP.');
+  if (!bytes.length || bytes.length > 15 * 1024 * 1024) throw new Error('Certificate file must be between 1 byte and 15 MB.');
+  // Do not trust browser-supplied extension/MIME metadata alone.
+  const isPdf = bytes.subarray(0, 5).toString('ascii') === '%PDF-';
+  const isPng = bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
+  const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  const isWebp = bytes.length >= 12 && bytes.subarray(0,4).toString('ascii') === 'RIFF' && bytes.subarray(8,12).toString('ascii') === 'WEBP';
+  const detected = isPdf ? 'application/pdf' : isPng ? 'image/png' : isJpeg ? 'image/jpeg' : isWebp ? 'image/webp' : '';
+  if (!detected || !allowedExt.has(ext) || (mime && detected !== mime)) throw new Error('File contents do not match a supported PDF/PNG/JPEG/WEBP certificate.');
+}
+function pdfBuffer(row, qrDataUrl) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 0 });
+    const SVGtoPDF = require('svg-to-pdfkit');
+    const chunks = [];
+    doc.on('data', chunk => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    const W = 841.89, H = 595.28;
+    const navy = '#082b68';
+    const blue = '#2f70d9';
+    const ink = '#13284b';
+    const muted = '#64748b';
+
+    // Clean certificate canvas and double border.
+    doc.rect(0, 0, W, H).fill('#ffffff');
+    doc.lineWidth(1.8).strokeColor('#d7e2f2').rect(5, 5, W - 10, H - 10).stroke();
+    doc.lineWidth(1).strokeColor('#9eb8dc').rect(20, 20, W - 40, H - 40).stroke();
+
+    // Decorative corner ribbons.
+    doc.save().fillColor(blue).polygon([0,452],[112,432],[126,595],[82,595],[0,482]).fill().restore();
+    doc.save().fillColor(blue).polygon([W,0],[790,0],[810,154],[W,142]).fill().restore();
+    doc.save().fillColor(blue).polygon([0,70],[112,52],[120,73],[0,94]).fill().restore();
+
+    // Header: brand, exact Srinivas Group SVG logo, then title with deliberate spacing.
+    doc.fontSize(9).font('Helvetica-Bold').fillColor(blue)
+      .text('CERTICHAIN', 0, 22, { width: W, align: 'center', characterSpacing: 2 });
+
+    try {
+      const svg = fs.readFileSync(path.join(__dirname, 'public', 'images.svg'), 'utf8');
+      // The repository SVG is the Srinivas Group logo. Render the full artwork,
+      // rather than drawing a simplified substitute.
+      SVGtoPDF(doc, svg, W / 2 - 41, 38, { width: 82, height: 98 });
+    } catch (e) {
+      doc.fontSize(7).font('Helvetica-Bold').fillColor(navy)
+        .text('SRINIVAS GROUP', W / 2 - 50, 58, { width: 100, align: 'center' });
+    }
+
+    doc.fontSize(26).font('Times-Bold').fillColor(navy)
+      .text('CERTIFICATE OF COMPLETION', 0, 151, { width: W, align: 'center' });
+
+    // Main certificate statement.
+    doc.fontSize(10.5).font('Helvetica').fillColor(muted)
+      .text('This is to certify that', 0, 194, { width: W, align: 'center' });
+
+    doc.fontSize(30).font('Times-Bold').fillColor(navy)
+      .text(row.studentName || 'Student', 80, 218, { width: W - 160, align: 'center' });
+
+    doc.fontSize(10.5).font('Helvetica').fillColor(muted)
+      .text('has successfully completed the requirements for', 0, 262, { width: W, align: 'center' });
+
+    doc.fontSize(18).font('Helvetica-Bold').fillColor(ink)
+      .text(row.course || 'Course / Qualification', 80, 287, { width: W - 160, align: 'center' });
+
+    doc.fontSize(10.5).font('Helvetica').fillColor(muted)
+      .text('at', 0, 316, { width: W, align: 'center' });
+
+    doc.fontSize(14).font('Helvetica-Bold').fillColor(navy)
+      .text(row.institution || 'Srinivas Institute Of Technology, Valachil', 55, 340, { width: W - 110, align: 'center' });
+
+    // Details row.
+    doc.lineWidth(1).strokeColor('#d7e2f2').moveTo(65, 374).lineTo(W - 65, 374).stroke();
+
+    const cols = [155, 350, 545, 705];
+    const labels = ['Certificate ID', 'Issue Date', 'Grade / Result', 'Status'];
+    const values = [row.id || '—', row.issueDate || '—', row.grade || '—', row.status || 'ACTIVE'];
+
+    labels.forEach((label, i) => {
+      doc.fontSize(8.5).font('Helvetica').fillColor(muted)
+        .text(label, cols[i] - 60, 389, { width: 120, align: 'center' });
+      doc.fontSize(10).font('Helvetica-Bold').fillColor(ink)
+        .text(String(values[i]), cols[i] - 72, 405, { width: 144, align: 'center' });
+    });
+
+    // QR verification block.
+    try {
+      const qr = Buffer.from(String(qrDataUrl).split(',')[1], 'base64');
+      doc.image(qr, 76, 438, { width: 68, height: 68 });
+    } catch {}
+
+    doc.fontSize(9).font('Helvetica-Bold').fillColor(navy)
+      .text('Verify with CertiChain', 158, 446);
+    doc.fontSize(8.5).font('Helvetica').fillColor(muted)
+      .text('Blockchain anchored credential', 158, 463);
+    doc.fontSize(8).font('Helvetica').fillColor('#7a8799')
+      .text('Scan the QR code to verify authenticity.', 158, 478);
+
+    // Authorized signature.
+    doc.fontSize(9).font('Times-Italic').fillColor(navy)
+      .text('Authorized Signatory', W - 225, 446, { width: 150, align: 'center' });
+    doc.lineWidth(1).strokeColor('#9eb8dc').moveTo(W - 225, 471).lineTo(W - 75, 471).stroke();
+    doc.fontSize(9).font('Helvetica-Bold').fillColor(ink)
+      .text(row.institution || 'CertiChain Issuer', W - 250, 479, { width: 200, align: 'center' });
+
+    doc.fontSize(8).font('Helvetica').fillColor('#7a8799')
+      .text('Secure • Verified • On Blockchain', 0, H - 31, { width: W, align: 'center' });
+
+    doc.end();
+  });
+}
+
+async function sendEmail(row, pdf) {
+  if (!row.studentEmail) throw new Error('Student email is required.');
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASSWORD) throw new Error('SMTP is not configured. Set SMTP_HOST, SMTP_USER and SMTP_PASSWORD in .env.');
+  const transporter = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: String(process.env.SMTP_SECURE) === 'true', auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD } });
+  await transporter.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to: row.studentEmail, subject: `Your CertiChain certificate — ${row.id}`, text: `Your certificate ${row.id} is attached. Verify it at ${row.verificationUrl}.`, attachments: [{ filename: `${row.id}.pdf`, content: pdf }] });
+}
+async function anchorCertificate(row, req) {
+  const tx = await registry.issueCertificate(row.id, row.blockchainHash);
+  const receipt = await tx.wait();
+  row.txHash = receipt.hash;
+  row.issuerAddress = issuerWallet.address;
+  row.contractAddress = deployment.address;
+  row.createdAt = new Date().toISOString();
+  row.verificationUrl = verificationUrl(req, row.id);
+  row.qrDataUrl = await makeQr(req, row);
+  saveData();
+  return row;
+}
+
+app.get('/api/health', async (req, res) => {
+  try { const block = await provider.getBlockNumber(); res.json({ ok: true, blockchain: 'connected', block, contract: deployment.address, issuer: issuerWallet.address }); }
+  catch (e) { res.status(503).json({ ok: false, blockchain: 'offline', error: safeError(e) }); }
+});
+app.get('/api/stats', requireAdmin, (req, res) => {
+  const total = data.certificates.length;
+  res.json({ total, active: data.certificates.filter(c => c.status === 'ACTIVE').length, revoked: data.certificates.filter(c => c.status === 'REVOKED').length, verifications: data.auditLogs.filter(a => a.action === 'VERIFY').length, students: new Set(data.certificates.map(c => c.studentEmail).filter(Boolean)).size });
+});
+app.post('/api/auth/login', (req, res) => {
+  if (loginRateLimited(req)) return res.status(429).json({ error: 'Too many login attempts. Try again in 15 minutes.' });
+  const { email = '', password = '', role } = req.body || {};
+  if (typeof email !== 'string' || typeof password !== 'string' || email.length > 254 || password.length > 1024) return res.status(400).json({ error: 'Invalid login input.' });
+  if (role === 'admin') {
+    if (email.toLowerCase() === ADMIN_EMAIL.toLowerCase() && passwordMatches(password, hashPassword(ADMIN_PASSWORD))) { clearLoginAttempts(req); return res.json({ token: tokenFor('admin', email.toLowerCase()), role: 'admin', email: email.toLowerCase() }); }
+    return res.status(401).json({ error: 'Invalid admin credentials.' });
+  }
+  if (role === 'student') {
+    const student = data.certificates.find(c => (c.studentEmail || '').toLowerCase() === email.toLowerCase() && c.studentPasswordHash);
+    if (student && passwordMatches(password, student.studentPasswordHash)) { clearLoginAttempts(req); return res.json({ token: tokenFor('student', email.toLowerCase()), role: 'student', email: email.toLowerCase() }); }
+    return res.status(401).json({ error: 'Invalid student credentials. The student portal password is set by the issuer when the certificate is created.' });
+  }
+  return res.status(400).json({ error: 'Invalid login role.' });
+});
+app.get('/api/me', requireUser, (req, res) => res.json({ role: req.user.role, email: req.user.email }));
+app.get('/api/certificates', requireAdmin, (req, res) => res.json(data.certificates.map(publicCertificate)));
+app.get('/api/student/certificates', requireUser, (req, res) => {
+  if (req.user.role !== 'student') return res.status(403).json({ error: 'Student access only.' });
+  res.json(data.certificates.filter(c => (c.studentEmail || '').toLowerCase() === req.user.email.toLowerCase()).map(publicCertificate));
+});
+app.get('/api/certificates/search', requireAdmin, (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase();
+  if (!q) return res.json([]);
+  const rows = data.certificates.filter(c =>
+    String(c.id || '').toLowerCase().includes(q) ||
+    String(c.studentName || '').toLowerCase().includes(q)
+  ).slice(0, 20);
+  res.json(rows.map(publicCertificate));
+});
+
+app.get('/api/certificates/:id', (req, res) => {
+  const row = findCertificate(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Certificate not found' });
+  res.json(publicVerificationCertificate(row));
+});
+app.get('/api/certificates/:id/qr', async (req, res) => {
+  try {
+    const row = findCertificate(req.params.id);
+    if (!row) return res.status(404).send('Certificate not found');
+    res.type('png');
+    res.send(await QRCode.toBuffer(encryptQrPayload(row), { width: 360, margin: 2, errorCorrectionLevel: 'M' }));
+  } catch (e) { res.status(500).send(safeError(e)); }
+});
+app.post('/api/qr/decode', requireAdmin, (req, res) => {
+  try {
+    const payload = decryptQrPayload(req.body?.qrData);
+    const row = findCertificate(payload.certificateId);
+    if (!row) {
+      log(payload.certificateId, 'QR_VERIFY', 'NOT_FOUND', req);
+      return res.status(404).json({ error: 'The encrypted QR is valid, but its certificate is not registered in this CertiChain database.' });
+    }
+    const matches =
+      row.studentName === payload.name &&
+      (row.studentEmail || '') === payload.email &&
+      row.course === payload.course &&
+      row.institution === payload.institution &&
+      row.issueDate === payload.issuedDate &&
+      (row.grade || '') === payload.grade;
+    if (!matches) {
+      log(row.id, 'QR_VERIFY', 'DATA_MISMATCH', req);
+      return res.status(409).json({ error: 'QR data does not match the registered certificate. Possible tampering detected.' });
+    }
+    log(row.id, 'QR_VERIFY', 'SUCCESS', req);
+    res.json({ valid: true, certificate: publicCertificate(row), message: 'Encrypted CertiChain QR verified successfully.' });
+  } catch (e) {
+    log(null, 'QR_VERIFY', 'INVALID_QR', req);
+    res.status(400).json({ error: safeError(e) });
+  }
+});
+
+app.post('/api/certificates/issue', requireAdmin, async (req, res) => {
+  try {
+    const { studentName, studentEmail = '', studentPassword = '', course, institution, issueDate, grade = '' } = req.body || {};
+    if (!studentName || !course || !institution || !issueDate) return res.status(400).json({ error: 'Student name, course, institution and issue date are required.' });
+    if (!studentEmail || !studentPassword || studentPassword.length < 8) return res.status(400).json({ error: 'Student email and a student portal password of at least 8 characters are required.' });
+    const payload = canonicalPayload({ studentName, studentEmail, course, institution, issueDate, grade });
+    const documentHash = sha256(payload);
+    const row = { id: makeCertificateId(), studentName, studentEmail, course, institution, issueDate, grade, status: 'ACTIVE', documentHash, blockchainHash: ethers.keccak256(ethers.toUtf8Bytes(documentHash)), sourceType: 'GENERATED', studentPasswordHash: hashPassword(studentPassword) };
+    await anchorCertificate(row, req); data.certificates.push(row); row.studentPasswordSet = true; saveData();
+    log(row.id, 'ISSUE', 'SUCCESS', req); res.status(201).json(publicCertificate(row));
+  } catch (e) { console.error(e); res.status(500).json({ error: safeError(e) }); }
+});
+
+app.post('/api/certificates/upload', requireAdmin, async (req, res) => {
+  try {
+    const { fileName, fileMime, fileData, studentName, studentEmail = '', studentPassword = '', course, institution = 'Srinivas Institute of Technology', issueDate, grade = '' } = req.body || {};
+    if (!fileData || !studentName || !course || !institution || !issueDate) return res.status(400).json({ error: 'Certificate file and extracted student name, course, institution and issue date are required.' });
+    if (!studentEmail || !studentPassword || studentPassword.length < 8) return res.status(400).json({ error: 'Student email and a student portal password of at least 8 characters are required.' });
+    const raw = dataUrlToBuffer(fileData);
+    validateUpload(fileName, fileMime, raw);
+    const id = makeCertificateId();
+    const documentHash = sha256(raw);
+    const safe = (fileName || `${id}.pdf`).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const saved = path.join(UPLOAD_DIR, `${id}-${safe}`);
+    fs.writeFileSync(saved, raw);
+    const row = { id, studentName, studentEmail, course, institution, issueDate, grade, status: 'ACTIVE', documentHash, blockchainHash: ethers.keccak256(ethers.toUtf8Bytes(documentHash)), sourceType: 'UPLOADED', fileName: safe, fileMime, filePath: path.relative(__dirname, saved), studentPasswordHash: hashPassword(studentPassword) };
+    try { await anchorCertificate(row, req); } catch (e) { fs.rmSync(saved, { force: true }); throw e; }
+    data.certificates.push(row);
+    row.studentPasswordSet = true; saveData();
+    log(row.id, 'UPLOAD', 'SUCCESS', req); res.status(201).json(publicCertificate(row));
+  } catch (e) { console.error(e); const message = e?.shortMessage || e?.reason || e?.message || ''; const conflict = /already registered|already exists/i.test(message); const clientError = /required|allowed|unsupported|contents do not match|between 1 byte|invalid base64|valid base64/i.test(message); res.status(conflict ? 409 : clientError ? 400 : 500).json({ error: conflict ? 'This certificate fingerprint is already registered on the blockchain.' : clientError ? message : safeError(e) }); }
+});
+
+app.post('/api/certificates/:id/revoke', requireAdmin, async (req, res) => {
+  try {
+    const row = findCertificate(req.params.id); if (!row) return res.status(404).json({ error: 'Certificate not found' });
+    if (row.status === 'REVOKED') return res.status(400).json({ error: 'Certificate already revoked.' });
+    const tx = await registry.revokeCertificate(row.id); const receipt = await tx.wait();
+    row.status = 'REVOKED'; row.revokedAt = new Date().toISOString(); row.revokeTxHash = receipt.hash; saveData();
+    log(row.id, 'REVOKE', `SUCCESS:${receipt.hash}`, req); res.json({ ok: true, txHash: receipt.hash });
+  } catch (e) { res.status(500).json({ error: safeError(e) }); }
+});
+
+app.post('/api/verify', async (req, res) => {
+  try {
+    const { certificateId, documentData } = req.body || {};
+    if (typeof certificateId !== 'string' || !certificateId.trim() || certificateId.length > 80) return res.status(400).json({ error: 'A valid certificate ID is required.' });
+
+    const local = findCertificate(certificateId);
+    if (!local) {
+      log(certificateId, 'VERIFY', 'NOT_FOUND', req);
+      return res.json({ valid: false, status: 'NOT_FOUND', message: 'No certificate with this ID exists.' });
+    }
+
+    let chain;
+    try {
+      chain = await registry.getCertificate(certificateId);
+    } catch {
+      log(certificateId, 'VERIFY', 'BLOCKCHAIN_NOT_FOUND', req);
+      return res.json({ valid: false, status: 'BLOCKCHAIN_NOT_FOUND', message: 'Certificate is not present on the blockchain.' });
+    }
+
+    const storedBlockchainHash = String(chain[0]).toLowerCase();
+    const localBlockchainHash = String(local.blockchainHash).toLowerCase();
+    const blockchainRecordMatches = storedBlockchainHash === localBlockchainHash;
+    const revoked = Boolean(chain[3]);
+
+    // ID-only verification checks the database record against the blockchain record.
+    // If the original document is supplied, also verify its exact SHA-256 bytes.
+    let documentChecked = false;
+    let documentMatches = true;
+    if (documentData) {
+      if (typeof documentData !== 'string' || documentData.length > 21 * 1024 * 1024) return res.status(413).json({ error: 'Uploaded document is too large.' });
+      if (local.sourceType !== 'UPLOADED') return res.status(400).json({ error: 'Exact-file verification is available for certificates registered from an uploaded original document.' });
+      documentChecked = true;
+      const submittedHash = sha256(dataUrlToBuffer(documentData));
+      documentMatches = submittedHash.toLowerCase() === String(local.documentHash).toLowerCase();
+    }
+
+    const valid = blockchainRecordMatches && documentMatches && !revoked;
+    const status = valid ? 'AUTHENTIC' : (revoked ? 'REVOKED' : (documentChecked && !documentMatches ? 'TAMPERED' : 'BLOCKCHAIN_MISMATCH'));
+
+    log(certificateId, 'VERIFY', status, req);
+
+    res.json({
+      valid,
+      status,
+      certificateId,
+      message: valid
+        ? (documentChecked ? 'Certificate ID and supplied document match the blockchain record.' : 'Certificate ID matches the blockchain record.')
+        : 'Certificate verification failed.',
+      certificate: {
+        studentName: local.studentName,
+        course: local.course,
+        institution: local.institution,
+        issueDate: local.issueDate,
+        grade: local.grade,
+        sourceType: local.sourceType
+      },
+      checks: {
+        databaseHashMatch: documentChecked ? documentMatches : true,
+        blockchainHashMatch: blockchainRecordMatches,
+        blockchainRevoked: revoked,
+        documentChecked,
+        issuer: chain[1],
+        issuedAt: Number(chain[2])
+      }
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: safeError(e) });
+  }
+});
+app.get('/api/certificates/:id/pdf', async (req, res) => {
+  try {
+    const row = findCertificate(req.params.id); if (!row) return res.status(404).send('Certificate not found');
+    const qr = await makeQr(req, row.id); const pdf = await pdfBuffer(row, qr);
+    res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', `attachment; filename="${row.id}.pdf"`); res.send(pdf);
+  } catch (e) { res.status(500).send(safeError(e)); }
+});
+app.post('/api/certificates/:id/email', requireAdmin, async (req, res) => {
+  try {
+    const row = findCertificate(req.params.id); if (!row) return res.status(404).json({ error: 'Certificate not found' });
+    row.verificationUrl = verificationUrl(req, row.id); const pdf = await pdfBuffer(row, await makeQr(req, row.id)); await sendEmail(row, pdf);
+    log(row.id, 'EMAIL', 'SENT', req); res.json({ ok: true, message: `Certificate emailed to ${row.studentEmail}` });
+  } catch (e) { res.status(500).json({ error: safeError(e) }); }
+});
+app.get('/api/audit', requireAdmin, (req, res) => res.json(data.auditLogs.slice(0, 100)));
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+app.listen(PORT, () => console.log(`CertiChain running at http://localhost:${PORT}`));
